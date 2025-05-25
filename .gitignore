@@ -1,0 +1,14 @@
+# R specific
+.Rhistory
+.RData
+.Rproj.user/
+*.[Rr]ds
+*.rda
+
+# TCGAbiolinks data download directory
+GDCdata_BRCA/
+GDCdata*/
+
+# General
+.DS_Store
+*.bak
