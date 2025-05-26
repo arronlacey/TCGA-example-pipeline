@@ -58,4 +58,3 @@ jobs:
                        # If index.qmd is configured to output to docs/, specify path: docs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Required for publishing
-```
