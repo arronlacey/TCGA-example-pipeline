@@ -40,6 +40,9 @@ jobs:
         # Consider adding caching for R packages here in a more advanced setup
         # e.g., using r-lib/actions/setup-r-dependencies@v2
 
+      - name: Run Data Acquisition and Preparation Script
+        run: Rscript scripts/01_data_acquisition_preparation.R
+
       - name: Render Quarto Document
         uses: quarto-dev/quarto-actions/render@v2
         with:
