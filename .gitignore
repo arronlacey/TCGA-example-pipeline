@@ -12,3 +12,9 @@ GDCdata*/
 # General
 .DS_Store
 *.bak
+
+# Quarto specific
+_freeze/
+_site/
+.quarto/
+```

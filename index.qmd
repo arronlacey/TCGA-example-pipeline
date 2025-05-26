@@ -1,0 +1,524 @@
+---
+title: "TCGA Differential Gene Expression and Survival Analysis"
+author: "AI Pipeline Generator"
+date: "today"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show code"
+    theme: cosmo
+---
+
+## Introduction
+
+This document presents an automated pipeline for conducting differential gene expression analysis and survival analysis using data from The Cancer Genome Atlas (TCGA). The primary goal is to identify genes whose expression levels are associated with patient survival outcomes.
+
+The analysis workflow includes:
+- Data acquisition and preprocessing from TCGA (demonstrated with TCGA-BRCA).
+- Definition of patient groups based on survival metrics.
+- Differential gene expression analysis between these groups.
+- Survival analysis (Kaplan-Meier plots) for identified differentially expressed genes.
+- Generation of summary visualizations such as volcano plots and heatmaps.
+
+This Quarto document integrates the R scripts previously developed for this pipeline, providing a reproducible and interactive report of the findings.
+
+*(Further sections will detail each step of the analysis.)*
+
+```{r setup, include=FALSE}
+# Load all necessary packages for the entire document
+# Ensure these are installed (e.g., via scripts/00_install_packages.R)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(DESeq2)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(pheatmap)
+library(ggrepel)
+library(knitr) # For kable
+
+# Create directories if they don't exist, suppress warnings if they do
+dir.create("data", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+dir.create("results/KM_plots", showWarnings = FALSE)
+```
+
+## Data Acquisition and Preparation
+
+The first step involves acquiring gene expression data (RNA-Seq counts) and corresponding clinical information for a chosen cancer type from The Cancer Genome Atlas (TCGA). For this demonstration, we use the Breast Invasive Carcinoma (TCGA-BRCA) dataset.
+
+The `TCGAbiolinks` package is used for this purpose. The following code chunk outlines the query, download, and preparation steps.
+
+**Note:** The data download and initial preparation steps performed by `GDCquery`, `GDCdownload`, and `GDCprepare` can be time-consuming and require significant disk space. The chunk below (`tcga-download-prepare`) is set to `eval: false` by default to prevent accidental re-execution during rendering of this document. **If you have not run `scripts/01_data_acquisition_preparation.R` script before, you need to either run that script first, or set `eval: true` for the chunk below and run it once to download and prepare the raw data.**
+
+```{r tcga-download-prepare, eval=FALSE, echo=TRUE, message=TRUE, warning=TRUE}
+# 1. Define Project and Query TCGA for RNA-Seq Data
+project_id <- "TCGA-BRCA"
+query_rnaseq <- GDCquery(
+    project = project_id,
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "HTSeq - Counts",
+    legacy = FALSE 
+)
+
+# 2. Download Data (using API method with a fallback to client)
+# Data is downloaded to a directory like GDCdata_BRCA/
+tryCatch({
+    GDCdownload(query_rnaseq, method = "api", files.per.chunk = 20, directory = "GDCdata_BRCA")
+}, error = function(e) {
+    message("API download failed, trying 'client' method: ", e$message)
+    GDCdownload(query_rnaseq, method = "client", files.per.chunk = 20, directory = "GDCdata_BRCA")
+})
+
+# 3. Prepare SummarizedExperiment Object
+# This step reads the downloaded files and assembles them into a SummarizedExperiment object.
+# It also matches samples with clinical data available from TCGAbiolinks.
+# The 'save.filename' will ensure the prepared object is saved, reducing future processing time.
+brca_data_raw <- GDCprepare(query_rnaseq, 
+                         save = TRUE, 
+                         save.filename = "data/brca_rnaseq_prepared_raw.rda",
+                         directory = "GDCdata_BRCA")
+
+message("Raw TCGA data prepared. Dimensions of SummarizedExperiment:")
+print(dim(brca_data_raw))
+message("Clinical data columns available initially:")
+print(colnames(colData(brca_data_raw)))
+```
+
+After the initial download and preparation, the `scripts/01_data_acquisition_preparation.R` script performs crucial filtering and processing steps. This includes:
+- Standardizing survival information (`OS_time`, `OS_status`).
+- Filtering out patients with missing or inadequate survival data.
+- Filtering the `SummarizedExperiment` to keep only these selected patients.
+- Performing initial gene filtering (e.g., removing genes with zero or very low counts).
+
+We will now load the pre-processed and filtered data objects that result from running `scripts/01_data_acquisition_preparation.R`.
+
+```{r load-prepared-data, echo=TRUE, message=TRUE}
+# Load the filtered SummarizedExperiment object and clinical data
+# These files should have been generated by running scripts/01_data_acquisition_preparation.R
+
+# Check if files exist
+se_filtered_path <- "data/brca_se_filtered.rda"
+clinical_filtered_path <- "data/brca_clinical_filtered.rda"
+
+if (!file.exists(se_filtered_path) || !file.exists(clinical_filtered_path)) {
+  stop(paste("ERROR: Processed data files not found. Please run 'scripts/01_data_acquisition_preparation.R' first to generate:",
+             se_filtered_path, "and", clinical_filtered_path))
+}
+
+load(se_filtered_path) # Loads 'brca_data_filtered'
+load(clinical_filtered_path) # Loads 'clinical_data_filtered'
+
+# Rename for clarity in Quarto, matching script 02
+brca_se_filtered <- brca_data_filtered
+rm(brca_data_filtered)
+brca_clinical_filtered <- clinical_data_filtered
+rm(clinical_data_filtered)
+
+
+message("Loaded pre-processed SummarizedExperiment object ('brca_se_filtered'):")
+print(brca_se_filtered)
+message("Dimensions of the assay (genes x samples):")
+print(dim(assay(brca_se_filtered)))
+
+message("\nLoaded pre-processed and matched clinical data ('brca_clinical_filtered'):")
+print(head(brca_clinical_filtered))
+message("Dimensions of clinical data (samples x attributes):")
+print(dim(brca_clinical_filtered))
+```
+
+## Define Patient Groups for Survival Analysis
+
+Using the processed clinical data, we categorize patients into groups based on their overall survival (OS) time. A common approach is to use the median OS time as a cutoff to define 'short-term' and 'long-term' survivor groups. This grouping is essential for the subsequent differential expression analysis.
+
+```{r define-patient-groups, echo=TRUE, message=TRUE}
+# Use the loaded 'brca_clinical_filtered' and 'brca_se_filtered'
+
+# Calculate median OS time from the filtered clinical data
+median_os_time <- median(brca_clinical_filtered$OS_time, na.rm = TRUE)
+message(paste("Median Overall Survival Time:", round(median_os_time, 2), "days"))
+
+# Create the 'survival_group' column
+brca_clinical_grouped <- brca_clinical_filtered %>%
+  mutate(survival_group = ifelse(OS_time <= median_os_time, "short_survivor", "long_survivor"))
+brca_clinical_grouped$survival_group <- factor(brca_clinical_grouped$survival_group, levels = c("short_survivor", "long_survivor"))
+
+message("Patient group distribution based on median OS time:")
+print(table(brca_clinical_grouped$survival_group))
+
+# Update the SummarizedExperiment object's colData with this new group information
+# Script 01 saves 'brca_clinical_filtered' where rownames are patient barcodes.
+# Script 01 also ensures that colnames(brca_se_filtered) are these same barcodes.
+
+# Create a mapping dataframe from brca_clinical_grouped
+# The 'barcode' column should exist if loaded from script 01 output, or use rownames
+if ("barcode" %in% colnames(brca_clinical_grouped)) {
+    group_mapping <- brca_clinical_grouped[, c("barcode", "survival_group")]
+} else { # Fallback if 'barcode' column is not present, use rownames
+    message("Using rownames from 'brca_clinical_grouped' as barcodes for mapping.")
+    group_mapping <- data.frame(
+        barcode = rownames(brca_clinical_grouped), 
+        survival_group = brca_clinical_grouped$survival_group
+    )
+}
+
+
+# Convert colData to data.frame for easier merge, then merge, then restore rownames
+se_coldata_df <- as.data.frame(colData(brca_se_filtered))
+
+# Add barcode column from rownames of se_coldata_df to ensure the key for joining exists
+# (colnames of brca_se_filtered are the barcodes)
+se_coldata_df$barcode_col_for_merge <- colnames(brca_se_filtered)
+
+se_coldata_df_merged <- se_coldata_df %>%
+  left_join(group_mapping, by = c("barcode_col_for_merge" = "barcode"))
+
+# Important: preserve original rownames of colData for SummarizedExperiment
+# The rownames of colData(brca_se_filtered) should be the same as colnames(brca_se_filtered)
+rownames(se_coldata_df_merged) <- se_coldata_df$barcode_col_for_merge
+
+# Assign the new column back to colData of brca_se_filtered
+# Make sure the order of se_coldata_df_merged matches the original colData order
+# left_join preserves the order of the left data frame (se_coldata_df)
+colData(brca_se_filtered)$survival_group <- factor(se_coldata_df_merged$survival_group, levels = c("short_survivor", "long_survivor"))
+
+
+# For subsequent steps, we'll use this updated brca_se_filtered and brca_clinical_grouped
+# save(brca_se_filtered, file = "data/brca_se_grouped_q.rda") # Renamed to avoid conflict
+# save(brca_clinical_grouped, file = "data/brca_clinical_grouped_q.rda")
+
+message("Updated SummarizedExperiment ('brca_se_filtered') with 'survival_group':")
+# print(brca_se_filtered) # This can be very long
+message("colData now contains 'survival_group'. First few entries:")
+print(head(colData(brca_se_filtered)))
+message("Summary of 'survival_group' in colData:")
+print(table(colData(brca_se_filtered)$survival_group, useNA = "ifany"))
+```
+
+## Differential Gene Expression Analysis
+
+With the patient groups defined, we can now perform differential gene expression (DGE) analysis to identify genes that are expressed at different levels between 'short_survivor' and 'long_survivor' groups. We will use the `DESeq2` package, which is designed for robust analysis of count-based RNA-Seq data.
+
+The core steps involve:
+1. Creating a `DESeqDataSet` object from our filtered and grouped SummarizedExperiment.
+2. Running the DESeq2 analysis pipeline.
+3. Extracting and examining the results.
+
+```{r differential-expression, echo=TRUE, message=TRUE, warning=TRUE}
+# The 'brca_se_filtered' object (updated with survival_group in its colData) 
+# from the previous chunk is used here.
+
+# Ensure 'survival_group' is a factor and set the reference level
+colData(brca_se_filtered)$survival_group <- factor(colData(brca_se_filtered)$survival_group, levels = c("short_survivor", "long_survivor"))
+message("Reference level for survival_group: ", levels(colData(brca_se_filtered)$survival_group)[1])
+
+# Create DESeqDataSet object
+# The design formula ~ survival_group tells DESeq2 to model gene expression based on this variable.
+dds <- DESeqDataSet(brca_se_filtered, design = ~ survival_group)
+message("DESeqDataSet created.")
+# print(dds) # Optional: print dds summary
+
+# Pre-filtering: Remove rows (genes) with very few reads across all samples.
+# This can improve the power and speed of the analysis.
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+message(paste("Genes kept after pre-filtering (sum of counts >= 10):", nrow(dds)))
+
+# Run the DESeq analysis
+# This function performs size factor estimation, dispersion estimation, and model fitting.
+# This step can take a few minutes.
+dds <- DESeq(dds)
+message("DESeq analysis complete.")
+
+# Extract results for the comparison between "long_survivor" and "short_survivor"
+# 'contrast' specifies the comparison: variable, numerator, denominator.
+# Positive log2FoldChange means higher expression in 'long_survivor' group.
+res <- results(dds, contrast=c("survival_group", "long_survivor", "short_survivor"))
+message("Results extracted.")
+
+# Order results by adjusted p-value
+res_ordered <- res[order(res$padj),]
+
+message("Summary of DESeq2 results:")
+summary(res_ordered)
+
+# Save the full ordered results table
+# This is useful for external analysis or sharing.
+if (!dir.exists("results")) {
+  dir.create("results")
+}
+write.csv(as.data.frame(res_ordered), file="results/diff_expr_results_all_quarto.csv")
+message("Full DESeq2 results saved to 'results/diff_expr_results_all_quarto.csv'")
+
+# Identify and save significant DEGs (e.g., padj < 0.05 & |log2FC| > 1)
+significant_degs_df <- subset(as.data.frame(res_ordered), padj < 0.05 & abs(log2FoldChange) > 1)
+# Add gene names as a column if they are rownames
+significant_degs_df$gene <- rownames(significant_degs_df) 
+significant_degs_df <- significant_degs_df[, c("gene", setdiff(names(significant_degs_df), "gene"))] # Move gene to first column
+
+write.csv(significant_degs_df, file="results/significant_degs_quarto.csv", row.names = FALSE)
+message(paste(nrow(significant_degs_df), "significant DEGs (padj < 0.05 & |log2FC| > 1) found."))
+message("Significant DEGs table saved to 'results/significant_degs_quarto.csv'")
+
+# Display top few significant DEGs
+message("\nTop significantly differentially expressed genes:")
+knitr::kable(head(significant_degs_df), caption = "Top Differentially Expressed Genes (DEGs)")
+```
+
+The results table contains several columns:
+- `baseMean`: Average normalized count across all samples.
+- `log2FoldChange`: The log2 fold change in expression between the 'long_survivor' and 'short_survivor' groups. A positive value indicates higher expression in long survivors.
+- `lfcSE`: Standard error of the log2 fold change.
+- `stat`: Wald statistic.
+- `pvalue`: Raw p-value.
+- `padj`: P-value adjusted for multiple testing (using Benjamini-Hochberg correction by default). This is the value typically used to determine significance.
+
+Genes with a small `padj` (e.g., < 0.05) and a non-zero `log2FoldChange` are considered differentially expressed.
+
+## Survival Analysis with Differentially Expressed Genes
+
+After identifying differentially expressed genes (DEGs) between the survival groups, we investigate whether the expression levels of these specific genes are associated with patient survival outcomes. Kaplan-Meier plots are a common way to visualize survival probabilities over time for different patient groups.
+
+Here, we will:
+1. Select a subset of the most significant DEGs.
+2. For each selected DEG, stratify patients into 'high expression' and 'low expression' groups.
+3. Generate and display Kaplan-Meier survival curves comparing these groups.
+
+```{r survival-analysis-degs, echo=TRUE, message=TRUE, warning=FALSE, fig.width=8, fig.height=7}
+# 'dds' (DESeqDataSet, after running DESeq()) and 
+# 'significant_degs_df' (dataframe of significant DEGs) should be available 
+# from the previous 'differential-expression' chunk.
+
+# 'brca_clinical_grouped' (clinical data with OS_time, OS_status, survival_group) 
+# should be available from the 'define-patient-groups' chunk.
+
+if (!exists("dds") || !exists("significant_degs_df") || !exists("brca_clinical_grouped")) {
+  stop("ERROR: Required objects ('dds', 'significant_degs_df', 'brca_clinical_grouped') not found. Ensure previous chunks have been run.")
+}
+
+# 1. Extract normalized expression data (e.g., using VST)
+# blind=FALSE because we are using it for visualization after DE analysis with the design formula
+vst_counts <- assay(vst(dds, blind = FALSE))
+message(paste("Dimensions of VST normalized expression data:", dim(vst_counts)[1], "genes x", dim(vst_counts)[2], "samples"))
+
+# 2. Select top DEGs for Kaplan-Meier plots
+# For example, top 2 up-regulated and top 2 down-regulated in 'long_survivor' group
+# (Modify N as needed, keeping it small for a document)
+# Ensure 'gene' column exists from the previous chunk's processing of significant_degs_df
+up_regulated_degs <- significant_degs_df %>% 
+  filter(log2FoldChange > 0) %>% 
+  arrange(padj) %>% 
+  head(2)
+
+down_regulated_degs <- significant_degs_df %>% 
+  filter(log2FoldChange < 0) %>% 
+  arrange(padj) %>% 
+  head(2)
+
+selected_degs_for_km <- rbind(up_regulated_degs, down_regulated_degs)
+
+if (nrow(selected_degs_for_km) == 0) {
+  message("No significant DEGs selected for Kaplan-Meier plots based on current criteria.")
+} else {
+  message(paste("Selected", nrow(selected_degs_for_km), "DEGs for Kaplan-Meier plots:"))
+  print(selected_degs_for_km[, c("gene", "log2FoldChange", "padj")])
+}
+
+# Ensure KM plot directory exists if saving plots (optional here, as they are embedded)
+# dir.create("results/KM_plots_quarto", showWarnings = FALSE)
+
+# 3. Generate Kaplan-Meier plots for each selected DEG
+for (i in 1:nrow(selected_degs_for_km)) {
+  gene_id <- selected_degs_for_km$gene[i]
+  log2fc <- round(selected_degs_for_km$log2FoldChange[i], 2)
+  padj_val <- formatC(selected_degs_for_km$padj[i], format = "e", digits = 2)
+
+  message(paste0("\nGenerating KM plot for: ", gene_id))
+  
+  # Get normalized expression for this gene
+  gene_expression <- vst_counts[gene_id, ]
+  
+  # Stratify patients by median expression
+  median_expr <- median(gene_expression, na.rm = TRUE)
+  expression_group <- ifelse(gene_expression >= median_expr, "high_expression", "low_expression")
+  expression_group <- factor(expression_group, levels = c("low_expression", "high_expression"))
+  
+  # Combine with clinical data for survival analysis
+  # Ensure brca_clinical_grouped has barcodes as rownames or a barcode column matching colnames(vst_counts)
+  # The 'define-patient-groups' chunk should provide 'brca_clinical_grouped'
+  # We assume colnames(vst_counts) are the patient barcodes.
+  # The 'define-patient-groups' chunk should ensure 'brca_clinical_grouped' has rownames that match.
+  
+  # Create data for survfit
+  # Match based on rownames of brca_clinical_grouped which should be barcodes
+  km_data <- data.frame(
+    OS_time = brca_clinical_grouped[colnames(vst_counts), "OS_time"],
+    OS_status = brca_clinical_grouped[colnames(vst_counts), "OS_status"],
+    expression_group = expression_group, # This is already aligned with colnames(vst_counts)
+    row.names = colnames(vst_counts)
+  )
+  km_data <- na.omit(km_data) # Remove samples with NA in any of these columns, vital for survfit
+
+  if(nrow(km_data) < 2 || length(unique(km_data$expression_group)) < 2) {
+    message(paste("Skipping KM plot for", gene_id, "- not enough data or groups after NA removal."))
+    next
+  }
+  
+  # Create Surv object
+  surv_obj <- Surv(time = km_data$OS_time, event = km_data$OS_status)
+  
+  # Fit survival model
+  fit <- survfit(surv_obj ~ expression_group, data = km_data)
+  
+  # Generate plot
+  km_plot <- ggsurvplot(
+    fit,
+    data = km_data,
+    title = paste0("Kaplan-Meier Plot for ", gene_id, 
+                   " (log2FC=", log2fc, ", padj=", padj_val, ")"),
+    pval = TRUE,
+    pval.method = TRUE, # Show method for p-value calculation
+    risk.table = TRUE,
+    legend.title = "Expression",
+    legend.labs = c("Low Expression", "High Expression"),
+    palette = c("blue", "red"),
+    ggtheme = theme_light() # Using a light theme for plots
+  )
+  
+  # Print the plot to render it in Quarto
+  print(km_plot)
+  
+  # Optional: Save plot to file
+  # ggsave(filename = paste0("results/KM_plots_quarto/KM_plot_", gene_id, ".pdf"), plot = km_plot$plot, width = 8, height = 7)
+}
+```
+
+This section demonstrates how the expression of individual DEGs relates to patient survival. Observe the separation of curves and the p-value to assess significance.
+
+## Summary Visualizations of Differential Expression
+
+To further explore the results of the differential gene expression analysis, we generate two key visualizations: a volcano plot and a heatmap of the top differentially expressed genes (DEGs).
+
+### Volcano Plot
+
+A volcano plot provides a comprehensive overview of the DGE results, displaying the statistical significance (p-value) versus the magnitude of change (log2 fold change) for every gene analyzed.
+
+```{r volcano-plot, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=7}
+# 'res_ordered' (DESeq2 results) should be available from the 'differential-expression' chunk.
+# 'significant_degs_df' (dataframe of significant DEGs) also from that chunk.
+
+if (!exists("res_ordered")) {
+  stop("ERROR: 'res_ordered' object not found. Ensure 'differential-expression' chunk has been run.")
+}
+if (!exists("significant_degs_df")) { # Added check for significant_degs_df
+  stop("ERROR: 'significant_degs_df' object not found. Ensure 'differential-expression' chunk has been run.")
+}
+
+# Convert res_ordered to data.frame for ggplot, ensure gene names are a column
+all_results_df <- as.data.frame(res_ordered)
+all_results_df$gene <- rownames(res_ordered)
+
+# Add a column to indicate significance and for labeling
+# Ensure 'gene' column exists in significant_degs_df for the labeling part
+all_results_df$is_significant <- ifelse(all_results_df$padj < 0.05 & !is.na(all_results_df$padj) & abs(all_results_df$log2FoldChange) > 1, "Significant", "Not Significant")
+all_results_df$label <- ifelse(all_results_df$gene %in% head(significant_degs_df$gene, 10), all_results_df$gene, "")
+
+volcano_plot <- ggplot(all_results_df, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = is_significant), alpha = 0.6) +
+  geom_text_repel(aes(label = label), max.overlaps = 20, size = 3) +
+  scale_color_manual(values = c("Significant" = "red", "Not Significant" = "grey")) +
+  labs(title = "Volcano Plot of Differential Gene Expression",
+       x = "Log2 Fold Change (Long Survivor vs. Short Survivor)",
+       y = "-log10 (Adjusted P-value)") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "blue") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(volcano_plot)
+```
+The volcano plot helps to quickly identify genes that are both statistically significant (high on the y-axis) and show a substantial change in expression (far out on the x-axis).
+
+### Heatmap of Top DEGs
+
+A heatmap can visualize the expression patterns of the top DEGs across all samples. This helps to see how well these genes differentiate the patient survival groups.
+
+```{r heatmap-degs, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+# 'vst_counts' (normalized expression data) should be available from 'survival-analysis-degs' chunk.
+# 'significant_degs_df' (significant DEGs) from 'differential-expression' chunk.
+# 'dds' (for colData) from 'differential-expression' chunk.
+
+if (!exists("vst_counts") || !exists("significant_degs_df") || !exists("dds")) {
+  stop("ERROR: Required objects ('vst_counts', 'significant_degs_df', 'dds') not found. Ensure previous chunks have run.")
+}
+
+# Select top DEGs for the heatmap (e.g., top 30 by padj)
+# Ensure 'gene' column is present in significant_degs_df
+top_degs_for_heatmap <- significant_degs_df %>%
+ arrange(padj) %>%
+ head(30)
+
+if (nrow(top_degs_for_heatmap) > 0) {
+  # Ensure genes selected for heatmap are present in vst_counts rownames
+  genes_for_heatmap_matrix <- intersect(top_degs_for_heatmap$gene, rownames(vst_counts))
+  if(length(genes_for_heatmap_matrix) == 0){
+      message("None of the top 30 DEGs found in VST counts. Skipping heatmap.")
+  } else {
+      if(length(genes_for_heatmap_matrix) < nrow(top_degs_for_heatmap)){
+          message(paste("Displaying heatmap for", length(genes_for_heatmap_matrix), 
+                        "genes (some of the top 30 DEGs were not found in VST counts)."))
+      }
+      heatmap_matrix <- vst_counts[genes_for_heatmap_matrix, ]
+      
+      # Prepare column annotation (survival group)
+      annotation_col_df <- as.data.frame(colData(dds)[, "survival_group", drop = FALSE])
+      rownames(annotation_col_df) <- colnames(dds) # Ensure rownames match sample names in dds/vst_counts
+      
+      # Define colors for annotation (optional)
+      # ann_colors <- list(
+      #   survival_group = c(short_survivor = "skyblue", long_survivor = "tomato")
+      # )
+
+      pheatmap( # pheatmap draws directly
+        heatmap_matrix,
+        annotation_col = annotation_col_df,
+        # annotation_colors = ann_colors, # Optional: custom colors for annotation
+        scale = "row", # Scale genes to have mean 0, sd 1
+        show_colnames = FALSE, # Hide sample names if too many
+        show_rownames = TRUE, # Show gene names
+        fontsize_row = 8,
+        main = paste("Heatmap of Top", length(genes_for_heatmap_matrix), "Differentially Expressed Genes")
+      )
+  }
+} else {
+  message("No significant DEGs to display in heatmap.")
+}
+
+```
+The heatmap displays genes in rows and samples in columns. Colors represent normalized expression levels (often Z-scores when row scaling is applied). Sample annotations (like survival group) help to correlate expression patterns with clinical features.
+
+## Conclusion
+
+This document has presented an automated pipeline for differential gene expression and survival analysis using TCGA data, implemented within a Quarto framework for reproducible reporting. The analysis successfully processed TCGA-BRCA data, identified differentially expressed genes between patient groups with distinct survival profiles, and visualized these findings through Kaplan-Meier plots, a volcano plot, and a heatmap.
+
+Key findings from this demonstration include:
+- The identification of `r if(exists("significant_degs_df")) nrow(significant_degs_df) else "[Number]"` significantly differentially expressed genes (padj < 0.05, |log2FC| > 1) between 'long_survivor' and 'short_survivor' groups.
+- Kaplan-Meier analysis of top DEGs, such as `r if(exists("selected_degs_for_km") && nrow(selected_degs_for_km) >= 1) selected_degs_for_km$gene[1] else "[Example Gene 1]"` and `r if(exists("selected_degs_for_km") && nrow(selected_degs_for_km) >= 2) selected_degs_for_km$gene[2] else "[Example Gene 2]"` (if available), indicated their potential association with patient survival.
+
+The integration of R code directly within this Quarto document ensures transparency and reproducibility of the analysis. The generated HTML report provides an accessible way to share these results.
+
+**Limitations and Future Directions:**
+- This analysis is based on a single TCGA cohort (BRCA). Further validation across other cohorts or datasets would be beneficial.
+- The definition of survival groups was based on a median split; other criteria or more complex survival models could be explored.
+- Functional enrichment analysis of the DEGs could provide deeper insights into the biological pathways involved.
+
+This pipeline serves as a foundation that can be adapted and extended for more specific research questions in cancer genomics.
+
+---
+
+***Note to User:** Please render this Quarto document to review all outputs, plots, and tables. You may need to manually update placeholders in the conclusion (like the number of DEGs or example gene names) if the dynamic insertion does not work as expected or if specific genes are preferred for highlighting.*
+```
