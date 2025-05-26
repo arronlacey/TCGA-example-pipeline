@@ -53,11 +53,8 @@ jobs:
 
       - name: Publish to GitHub Pages
         uses: quarto-dev/quarto-actions/publish@v2
-        with:
-          target-branch: gh-pages # Deploy to the gh-pages branch
-          # path: _site # Default path quarto render outputs to, if not rendering to docs/
-                       # If quarto-actions/render produces output in _site (default),
-                       # then quarto-actions/publish will pick it up from there.
-                       # If index.qmd is configured to output to docs/, specify path: docs
+        # Removed 'with: target-branch: gh-pages' to use action defaults
+        # The action should automatically find the '_site' directory from the render step
+        # and deploy to the 'gh-pages' branch by default.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Required for publishing
