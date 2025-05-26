@@ -22,15 +22,16 @@ message("Libraries loaded.")
 project_id <- "TCGA-BRCA"
 message(paste("Project ID set to:", project_id))
 
-# --- 3. Use GDCquery to find RNA-Seq HTSeq - Counts data ---
-message("Querying GDC for RNA-Seq data...")
+# --- 3. Use GDCquery to find RNA-Seq STAR - Counts data ---
+message("Querying GDC for RNA-Seq data (using STAR - Counts workflow type)...")
 query_rnaseq <- GDCquery(
     project = project_id,
     data.category = "Transcriptome Profiling",
     data.type = "Gene Expression Quantification",
-    workflow.type = "HTSeq - Counts"
+    workflow.type = "STAR - Counts" # Corrected workflow.type
 )
 message("GDCquery complete. Number of results: ", nrow(getResults(query_rnaseq)))
+
 
 # --- 4. Download the data using GDCdownload ---
 message("Downloading data using GDCdownload...")
