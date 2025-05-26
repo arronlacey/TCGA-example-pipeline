@@ -7,7 +7,7 @@ if (!requireNamespace("BiocManager", quietly = TRUE)) {
 bioc_packages <- c("TCGAbiolinks", "DESeq2", "SummarizedExperiment")
 
 # Define CRAN packages
-cran_packages <- c("survival", "survminer", "ggplot2", "pheatmap", "R.utils")
+cran_packages <- c("survival", "survminer", "ggplot2", "pheatmap", "R.utils", "rmarkdown", "dplyr", "ggrepel", "knitr")
 
 # Install Bioconductor packages
 message("Checking and installing Bioconductor packages...")
